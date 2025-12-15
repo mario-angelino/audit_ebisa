@@ -6,7 +6,7 @@ from database import conectar, desconectar
 import pandas as pd
 
 
-def obter_empresa_id_por_razao_social(razao_social):
+def obter_empresa_id_por_razao_social(empresa):
     """
     Busca ID da empresa pelo nome da empresa
 
@@ -22,7 +22,7 @@ def obter_empresa_id_por_razao_social(razao_social):
         cursor = conn.cursor()
 
         query = "SELECT cod_empresa FROM public.ebisa_empresa_sienge WHERE nome_empresa = %s"
-        cursor.execute(query, (razao_social,))
+        cursor.execute(query, (empresa,))
 
         resultado = cursor.fetchone()
         return resultado[0] if resultado else None
@@ -38,7 +38,10 @@ def obter_empresa_id_por_razao_social(razao_social):
 def deletar_balancete_existente(empresa_id, mes, ano):
     """
     Deleta balancete existente (mesma empresa + mês + ano)
-    CASCADE vai deletar os itens automaticamente
+    Processo:
+      1) Busca o id em ebisa_cont_balancete
+      2) Deleta itens em ebisa_cont_balancete_itens
+      3) Deleta o registro em ebisa_cont_balancete
 
     Args:
         empresa_id: ID da empresa
@@ -53,32 +56,72 @@ def deletar_balancete_existente(empresa_id, mes, ano):
         conn = conectar()
         cursor = conn.cursor()
 
-        query = """
-            DELETE FROM public.balancete
-            WHERE empresa_id = %s AND mes = %s AND ano = %s
-        """
+        # --------------------------------------------------
+        # 1) Buscar o balancete_id
+        # --------------------------------------------------
+        cursor.execute(
+            """
+            SELECT id
+            FROM public.ebisa_cont_balancete
+            WHERE empresa_id = %s
+              AND mes = %s
+              AND ano = %s
+            LIMIT 1
+            """,
+            (empresa_id, mes, ano)
+        )
 
-        cursor.execute(query, (empresa_id, mes, ano))
-        linhas_deletadas = cursor.rowcount
+        row = cursor.fetchone()
+
+        if not row:
+            conn.commit()
+            return (True, "ℹ️ Nenhum balancete anterior encontrado")
+
+        balancete_id = row[0]
+
+        # --------------------------------------------------
+        # 2) Deletar itens do balancete
+        # --------------------------------------------------
+        cursor.execute(
+            """
+            DELETE FROM public.ebisa_cont_balancete_itens
+            WHERE balancete_id = %s
+            """,
+            (balancete_id,)
+        )
+        itens_deletados = cursor.rowcount
+
+        # --------------------------------------------------
+        # 3) Deletar balancete (cabeçalho)
+        # --------------------------------------------------
+        cursor.execute(
+            """
+            DELETE FROM public.ebisa_cont_balancete
+            WHERE id = %s
+            """,
+            (balancete_id,)
+        )
 
         conn.commit()
 
-        if linhas_deletadas > 0:
-            return (True, f"🗑️ Balancete anterior deletado ({linhas_deletadas} registro)")
-        else:
-            return (True, "ℹ️ Nenhum balancete anterior encontrado")
+        return (
+            True,
+            f"🗑️ Balancete anterior deletado com sucesso "
+            f"(itens removidos: {itens_deletados})"
+        )
 
     except Exception as e:
         if conn:
             conn.rollback()
         print(f"❌ Erro ao deletar balancete: {e}")
         return (False, f"❌ Erro ao deletar: {str(e)}")
+
     finally:
         if conn:
             desconectar(conn)
 
 
-def inserir_balancete(empresa_id, mes, ano, df_itens, user_email):
+def inserir_balancete(empresa_id, mes, ano, df_itens, user):
     """
     Insere novo balancete (cabeçalho + itens)
     OTIMIZAÇÃO: Grava somente linhas com movimento (valores diferentes de zero)
@@ -88,14 +131,14 @@ def inserir_balancete(empresa_id, mes, ano, df_itens, user_email):
         mes: mês (1-12)
         ano: ano (ex: 2025)
         df_itens: DataFrame com os itens do balancete
-        user_email: email do usuário que está importando
+        user: email do usuário que está importando
 
     Returns:
         tuple (sucesso: bool, mensagem: str, balancete_id: int ou None)
     """
     print(f"🔍 [DEBUG] inserir_balancete - Início")
     print(
-        f"🔍 [DEBUG] empresa_id={empresa_id}, mes={mes}, ano={ano}, user_email={user_email}")
+        f"🔍 [DEBUG] empresa_id={empresa_id}, mes={mes}, ano={ano}, user={user}")
     print(f"🔍 [DEBUG] Total de linhas no DataFrame: {len(df_itens)}")
 
     conn = None
@@ -106,22 +149,23 @@ def inserir_balancete(empresa_id, mes, ano, df_itens, user_email):
 
         # 1. Inserir cabeçalho do balancete
         query_cabecalho = """
-            INSERT INTO public.balancete (empresa_id, mes, ano, user_importacao)
+            INSERT INTO public.ebisa_cont_balancete (empresa_id, mes, ano, user_importacao)
             VALUES (%s, %s, %s, %s)
             RETURNING id
         """
 
         print(f"🔍 [DEBUG] Executando insert do cabeçalho...")
-        cursor.execute(query_cabecalho, (empresa_id, mes, ano, user_email))
+        cursor.execute(query_cabecalho, (empresa_id, mes, ano, user["email"]))
         balancete_id = cursor.fetchone()[0]
         print(f"🔍 [DEBUG] Cabeçalho inserido! balancete_id={balancete_id}")
 
         # 2. Inserir itens do balancete
         query_itens = """
-            INSERT INTO public.balancete_itens (
-                balancete_id, nivel, conta, descricao,
-                saldo_anterior, val_debito, val_credito, saldo_atual
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO public.ebisa_cont_balancete_itens (
+                balancete_id, cod_conta, nome_conta,
+                saldo_anterior, val_debito, val_credito, saldo_atual,
+                cod_reduzido, cod_centro_custo, nome_centro_custo
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
 
         # Preparar dados para inserção em lote
@@ -131,31 +175,31 @@ def inserir_balancete(empresa_id, mes, ano, df_itens, user_email):
         print(f"🔍 [DEBUG] Iniciando processamento de itens...")
         for idx, row in df_itens.iterrows():
             # Converter valores para float
-            saldo_anterior = float(row['Saldo Anterior'])
-            val_debito = float(row['Val. Débito'])
-            val_credito = float(row['Val. Crédito'])
-            saldo_atual = float(row['Saldo Atual'])
+            saldo_anterior = float(row['saldo_anterior'])
+            val_debito = float(row['val_debito'])
+            val_credito = float(row['val_credito'])
+            saldo_atual = float(row['saldo_atual'])
 
             # FILTRO: Gravar SOMENTE se pelo menos um valor for diferente de zero
-            if saldo_anterior != 0 or val_debito != 0 or val_credito != 0 or saldo_atual != 0:
-                item = (
-                    balancete_id,
-                    row['Nível'] if row['Nível'] not in [
-                        '', 'nan', 'None'] else None,
-                    row['Conta'],
-                    row['Desc. Conta'] if row['Desc. Conta'] not in [
-                        '', 'nan', 'None'] else None,
-                    saldo_anterior,
-                    val_debito,
-                    val_credito,
-                    saldo_atual
-                )
-                itens_para_inserir.append(item)
-            else:
-                linhas_ignoradas += 1
+            #if saldo_anterior != 0 or val_debito != 0 or val_credito != 0 or saldo_atual != 0:
+            item = (
+                balancete_id,
+                row['cod_conta'],
+                row['nome_conta'],
+                saldo_anterior,
+                val_debito,
+                val_credito,
+                saldo_atual,
+                row['cod_reduzido'],
+                row['cod_centro_custo'],
+                row['nome_centro_custo']
+            )
+            itens_para_inserir.append(item)
+            #else:
+            #    linhas_ignoradas += 1
 
         print(
-            f"🔍 [DEBUG] Itens processados: {len(itens_para_inserir)} para inserir, {linhas_ignoradas} ignoradas")
+            f"🔍 [DEBUG] Itens processados: {len(itens_para_inserir)} para inserir")
 
         # Executar inserção em lote (somente linhas com movimento)
         if itens_para_inserir:
@@ -233,7 +277,7 @@ def importar_balancete(empresa, mes, ano, df_itens, user):
     # 3. Inserir novo balancete
     print(f"🔍 [DEBUG] Chamando inserir_balancete...")
     sucesso, msg_insert, balancete_id = inserir_balancete(
-        empresa_id, mes, ano, df_itens, user_email)
+        empresa_id, mes, ano, df_itens, user)
     print(
         f"🔍 [DEBUG] Resultado insert: sucesso={sucesso}, balancete_id={balancete_id}")
 

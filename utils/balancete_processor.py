@@ -266,23 +266,20 @@ def run_processor():
 
         # Chamar a função de importação (essa função deve existir em utils.balancete_db)
         try:
-            with st.spinner("Importando plano de contas..."):
-                resultado = importar_balancete(
-                    razao_social=empresa if isinstance(
+            with st.spinner("Importando balancetes..."):
+                sucesso, mensagem = importar_balancete(
+                    empresa=empresa if isinstance(
                         empresa, str) else str(empresa),
                     mes=int(mes),
                     ano=int(ano),
                     df_itens=df_preview,
-                    user_email=user
+                    user=user
                 )
 
-            if resultado.get("success"):
-                st.success(
-                    f"✅ Balancete importado com sucesso! Registros inseridos: {resultado.get('rows', 'N/D')}.")
-                # Limpar estado do fluxo
+            if sucesso:
+                st.success(f"✅ Balancete importado com sucesso!\n{mensagem}")
                 _limpar_estado_pos_import()
             else:
-                st.error(
-                    f"❌ Falha ao importar: {resultado.get('message', 'Erro desconhecido.')}")
+                st.error(f"❌ Falha ao importar:\n{mensagem}")
         except Exception as e:
             st.exception(f"Erro inesperado durante importação: {e}")
